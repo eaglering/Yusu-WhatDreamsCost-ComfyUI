@@ -1,7 +1,8 @@
-const { app } = window.comfyAPI.app;
-const { api } = window.comfyAPI.api;
+import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 import { calculatePlaybackDurationFrames, calculateSegmentRange, calculateTimelineDurationFrames, pullSegmentsAfterShrink, pushOverlappingSegmentsForward, shouldAutoSyncDuration, splitSegmentTailAfterShrink } from "./timeline_duration.js";
 import { clampSegmentLengthToSource } from "./director_video_segments.js";
+import { normalizeDirectorWidgetValue, selectDirectorWidgetSchema } from "./director_widget_migration.js";
 
 // --- UI Constants & Configuration ---
 const RULER_HEIGHT = 24;
@@ -805,6 +806,7 @@ class TimelineEditor {
     this._lastWidth = 0;
     this._hoveredGapIdx = -1;
     this._isHovering = false;
+    this._destroyed = false;
 
     // Playback state
     this.currentFrame = 0;
@@ -1147,7 +1149,7 @@ class TimelineEditor {
     }
 
     // Polling is much more reliable in Comfy than ResizeObserver due to scale transforms
-    this._renderLoop = requestAnimationFrame(() => this.checkResize());
+    this._renderLoop = setTimeout(() => this.checkResize(), 100);
   }
 
   isMultiSelectActive() {
@@ -1270,10 +1272,27 @@ class TimelineEditor {
   }
 
   destroy() {
-    cancelAnimationFrame(this._renderLoop);
+    this._destroyed = true;
+    clearTimeout(this._renderLoop);
+    cancelAnimationFrame(this._mouseMoveFrame);
     this.pauseAudio();
     window.removeEventListener("keydown", this.handleKeyDown, true);
     window.removeEventListener("paste", this.handlePaste, true);
+    window.removeEventListener("mousemove", this._windowMouseMove);
+    window.removeEventListener("mouseup", this._windowMouseUp);
+    document.removeEventListener("mousemove", this._globalPropMouseMove);
+    document.removeEventListener("mouseup", this._globalPropMouseUp);
+    this.dismissContextMenu?.();
+    this.dismissGapMenu?.();
+    this.dismissSettingsMenu?.();
+    for (const video of this._videoElementsCache?.values?.() || []) {
+      try { video.pause(); } catch (_) { }
+    }
+    this._videoElementsCache?.clear?.();
+    this._thumbnailCache?.clear?.();
+    this._thumbnailPromises?.clear?.();
+    this._audioBufferCache?.clear?.();
+    this.audioContext?.close?.().catch?.(() => { });
   }
 
   getStartFrames() {
@@ -1289,7 +1308,7 @@ class TimelineEditor {
   }
 
   // Grow the timeline duration to fit `requiredFrames` if it is currently shorter.
-  // The timeline only ever grows — never shrinks — through this method.
+  // The timeline only ever grows ...never shrinks ...through this method.
   growTimelineIfNeeded(requiredFrames) {
     if (!shouldAutoSyncDuration(this.manualOutputRange)) return;
     const current = this.getDurationFrames();
@@ -1383,8 +1402,8 @@ class TimelineEditor {
   }
 
   // Returns the visual timeline length in frames:
-  // the furthest segment end (across both tracks) × 1.30, with a floor of getDurationFrames().
-  // This is used for all rendering/positioning — the actual output duration is getDurationFrames().
+  // the furthest segment end (across both tracks) x 1.30, with a floor of getDurationFrames().
+  // This is used for all rendering/positioning ...the actual output duration is getDurationFrames().
   getVisualDurationFrames() {
     if (this.retakeMode) {
       if (this.timeline.retakeVideo) {
@@ -1448,6 +1467,7 @@ class TimelineEditor {
 
   _liveScrubVideo(seg, edge) {
     if (!seg || (seg.type !== "video" && seg.type !== "motion_video")) return;
+    if (seg.isStaticImage) return;
     this._ensureVideoEl(seg);
     if (!seg.videoEl) return;
     const targetSec = edge === "end"
@@ -1478,7 +1498,7 @@ class TimelineEditor {
       }
     }
 
-    const motionSeg = this.timeline.motionSegments.find(s => s.type === "motion_video" && targetFrame >= s.start && targetFrame < s.start + s.length);
+    const motionSeg = this.timeline.motionSegments.find(s => s.type === "motion_video" && !s.isStaticImage && targetFrame >= s.start && targetFrame < s.start + s.length);
     if (motionSeg) {
       this._ensureVideoEl(motionSeg);
       if (motionSeg.videoEl) {
@@ -1489,6 +1509,7 @@ class TimelineEditor {
   }
 
   async _ensureThumbnails(seg) {
+    if (seg.isStaticImage) return;
     if (seg.thumbnails) return;
     if (seg._extractingThumbs) return;
 
@@ -1735,6 +1756,7 @@ class TimelineEditor {
 
   _ensureVideoEl(seg) {
     if (!seg) return;
+    if (seg.isStaticImage) return;
 
     if (seg.videoEl) {
       if (seg.videoEl.duration && !seg.videoDurationFrames) {
@@ -1755,7 +1777,7 @@ class TimelineEditor {
     this._videoElementsCache = this._videoElementsCache || new Map();
 
     if (this._videoElementsCache.has(cacheKey)) {
-      // Reuse the existing shared video element — do NOT re-seek it.
+      // Reuse the existing shared video element ...do NOT re-seek it.
       // Running initVideoSeek on an already-initialized element causes cascading seeks
       // when multiple split segments share it (e.g. seg2 seeks to 5min, seg3 seeks to 10min),
       // which breaks playback on long videos. Just grab the reference and ensure thumbnails.
@@ -2018,6 +2040,7 @@ class TimelineEditor {
 
 
   async _preloadMotionAudioSegment(seg) {
+    if (seg.isStaticImage) return;
     if (seg._audioBuffer || seg._decodingAudio) return;
     if (!seg.videoFile && !seg._blobUrl) return;
 
@@ -2121,6 +2144,80 @@ class TimelineEditor {
       this._ensureVideoEl(this.timeline.retakeVideo);
       this._ensureThumbnails(this.timeline.retakeVideo);
     }
+  }
+
+  syncLinkedICFrames(linkId, sourceNode) {
+    const widgetValue = (name, fallback = 0) => {
+      const value = sourceNode?.widgets?.find(w => w.name === name)?.value;
+      return Number.isFinite(Number(value)) ? Number(value) : fallback;
+    };
+    const connected = linkId != null;
+    const frameCount = Math.max(1,
+      widgetValue("frame_count") ||
+      widgetValue("duration_frames") ||
+      Math.round(widgetValue("duration") * this.getFrameRate()) ||
+      this.getDurationFrames()
+    );
+    const signature = connected ? `${linkId}|${frameCount}` : "";
+    const previous = this.timeline.motionSegments.find(seg => seg.linkedICFrames);
+    const hasManualICSegment = this.timeline.motionSegments.some(
+      seg => !seg.linkedICFrames
+        && seg.type === "motion_video"
+        && (Boolean(seg.videoFile) || seg._uploading === true)
+    );
+
+    if (connected && hasManualICSegment) {
+      if (previous) {
+        const previousEnd = previous.start + previous.length;
+        this.timeline.motionSegments = this.timeline.motionSegments.filter(seg => !seg.linkedICFrames);
+        pullSegmentsAfterShrink(
+          this.timeline.motionSegments,
+          previousEnd,
+          previous.start,
+          previous.id,
+        );
+        this.commitChanges(true);
+        this.render();
+      }
+      this._linkedICFramesSignature = signature;
+      return;
+    }
+
+    if (signature === this._linkedICFramesSignature && ((!connected && !previous) || (connected && previous))) return;
+    if (!connected && !previous) {
+      this._linkedICFramesSignature = signature;
+      return;
+    }
+
+    const previousEnd = previous ? previous.start + previous.length : 0;
+    this.timeline.motionSegments = this.timeline.motionSegments.filter(seg => !seg.linkedICFrames);
+    this._linkedICFramesSignature = signature;
+
+    if (connected) {
+      const seg = {
+        id: previous?.id || "ic_lora_input",
+        type: "motion_video",
+        start: previous?.start ?? 0,
+        length: frameCount,
+        trimStart: 0,
+        videoDurationFrames: frameCount,
+        videoFile: "",
+        fileName: "Connected IMAGE frames",
+        videoStrength: previous?.videoStrength ?? 1.0,
+        videoAttentionStrength: previous?.videoAttentionStrength ?? 0.65,
+        resampleMode: previous?.resampleMode || "nearest",
+        linkedICFrames: true,
+      };
+      this.timeline.motionSegments.push(seg);
+      if (previous && frameCount < previous.length) {
+        pullSegmentsAfterShrink(this.timeline.motionSegments, previousEnd, seg.start + seg.length, seg.id);
+      }
+      pushOverlappingSegmentsForward(this.timeline.motionSegments, seg.id);
+      if (!this.retakeMode) this.growTimelineIfNeeded(seg.start + seg.length);
+    }
+
+    this.commitChanges(true);
+    this.render();
   }
 
   createDOM() {
@@ -2257,7 +2354,7 @@ class TimelineEditor {
 
     this.motionFileInput = document.createElement("input");
     this.motionFileInput.type = "file";
-    this.motionFileInput.accept = "video/*";
+    this.motionFileInput.accept = "video/*,image/*";
     this.motionFileInput.multiple = true;
     this.motionFileInput.style.display = "none";
     this.motionFileInput.addEventListener("change", (e) => this.handleMotionUpload(e.target.files));
@@ -2862,7 +2959,8 @@ class TimelineEditor {
       ev.preventDefault();
     });
 
-    document.addEventListener("mousemove", (ev) => {
+    this._globalPropMouseMove = (ev) => {
+      if (!this.container?.isConnected) return;
       if (isGlobalResizing) {
         const newH = Math.max(60, startGlobalH + (ev.clientY - startGlobalY));
         this.globalPropHeight = newH;
@@ -2877,13 +2975,15 @@ class TimelineEditor {
           }
         }
       }
-    });
+    };
 
-    document.addEventListener("mouseup", () => {
+    this._globalPropMouseUp = () => {
       if (isGlobalResizing) {
         isGlobalResizing = false;
       }
-    });
+    };
+    document.addEventListener("mousemove", this._globalPropMouseMove);
+    document.addEventListener("mouseup", this._globalPropMouseUp);
 
     globalPropContainer.appendChild(globalPromptWrapper);
     globalPropContainer.appendChild(globalPropResizer);
@@ -3026,6 +3126,7 @@ class TimelineEditor {
 
         let mouseFrameX = x * (totalFrames / logicalWidth);
         let startFrame = clamp(Math.round(mouseFrameX - newLength / 2), 0, totalFrames - newLength);
+        if (trackType === "image" && arrToModify.length === 0) startFrame = 0;
 
         this._ghostInitialTimeline.push({
           id: this._ghostSegmentId,
@@ -3114,14 +3215,40 @@ class TimelineEditor {
           }
         } else if (audioFiles.length > 0 && (targetTrack === "audio" || imageFiles.length === 0)) {
           this.handleAudioUpload(audioFiles, targetFrameStart);
+        } else if (imageFiles.length > 0 && targetTrack === "motion") {
+          this.handleMotionUpload(imageFiles, targetFrameStart);
         } else if (imageFiles.length > 0) {
           this.handleImageUpload(imageFiles, targetFrameStart);
         }
       }
     });
 
-    window.addEventListener("mousemove", (e) => this.onMouseMove(e));
-    window.addEventListener("mouseup", (e) => this.onMouseUp(e));
+    this._windowMouseMove = (e) => {
+      if (!this.container?.isConnected) return;
+      if (!this._isDragging && !this._isSelectingBox && !this._isHovering) return;
+      if (!this._isDragging && !this._isSelectingBox && this.container.offsetParent === null) return;
+      this._pendingMouseMoveEvent = e;
+      if (this._mouseMoveFrame) return;
+      this._mouseMoveFrame = requestAnimationFrame(() => {
+        this._mouseMoveFrame = null;
+        const pending = this._pendingMouseMoveEvent;
+        this._pendingMouseMoveEvent = null;
+        if (pending) this.onMouseMove(pending);
+      });
+    };
+    this._windowMouseUp = (e) => {
+      if (!this.container?.isConnected && !this._isDragging) return;
+      if (this._pendingMouseMoveEvent) {
+        cancelAnimationFrame(this._mouseMoveFrame);
+        this._mouseMoveFrame = null;
+        const pending = this._pendingMouseMoveEvent;
+        this._pendingMouseMoveEvent = null;
+        this.onMouseMove(pending);
+      }
+      this.onMouseUp(e);
+    };
+    window.addEventListener("mousemove", this._windowMouseMove);
+    window.addEventListener("mouseup", this._windowMouseUp);
 
     // --- Player Controls ---
     const playerControls = document.createElement("div");
@@ -3896,23 +4023,27 @@ class TimelineEditor {
   }
 
   checkResize() {
-    this.syncLayoutToNode(false);
-    const viewportWidth = this.viewport.clientWidth;
-    const currentScale = this.getRenderScale();
+    if (this._destroyed) return;
+    if (this.container?.isConnected && this.container.getClientRects().length > 0 && !document.hidden) {
+      this.node?._syncICVideoFromLink?.();
+      this.syncLayoutToNode(false);
+      const viewportWidth = this.viewport.clientWidth;
+      const currentScale = this.getRenderScale();
 
-    if (viewportWidth > 0 && (this._lastWidth !== viewportWidth || this._lastZoom !== this.zoomLevel || this._lastScale !== currentScale)) {
-      this._lastWidth = viewportWidth;
-      this._lastZoom = this.zoomLevel;
-      this._lastScale = currentScale;
+      if (viewportWidth > 0 && (this._lastWidth !== viewportWidth || this._lastZoom !== this.zoomLevel || this._lastScale !== currentScale)) {
+        this._lastWidth = viewportWidth;
+        this._lastZoom = this.zoomLevel;
+        this._lastScale = currentScale;
 
-      const newCanvasWidth = Math.max(viewportWidth, viewportWidth * this.zoomLevel);
-      this.canvas.style.width = newCanvasWidth + "px";
-      this.resizeCanvas(newCanvasWidth);
+        const newCanvasWidth = Math.max(viewportWidth, viewportWidth * this.zoomLevel);
+        this.canvas.style.width = newCanvasWidth + "px";
+        this.resizeCanvas(newCanvasWidth);
 
-      if (this.node) this.node.setDirtyCanvas?.(true, true);
-      else if (window.app && window.app.graph) window.app.graph.setDirtyCanvas(true, true);
+        if (this.node) this.node.setDirtyCanvas?.(true, true);
+        else if (window.app && window.app.graph) window.app.graph.setDirtyCanvas(true, true);
+      }
     }
-    this._renderLoop = requestAnimationFrame(() => this.checkResize());
+    this._renderLoop = setTimeout(() => this.checkResize(), 200);
   }
 
   syncLayoutToNode(forceRender = true) {
@@ -3997,112 +4128,98 @@ class TimelineEditor {
     for (let file of files) {
       if (!file.type.startsWith("image/")) continue;
 
-      await new Promise(async (resolve) => {
-        try {
-          const body = new FormData();
-          body.append("image", file);
-          body.append("subfolder", "whatdreamscost");
-          const resp = await api.fetchApi("/upload/image", { method: "POST", body });
-          if (resp.status !== 200) { resolve(); return; }
-
-          const data = await resp.json();
-          const filename = data.name;
-          const subfolder = data.subfolder || "";
-          const imageFile = subfolder ? subfolder + "/" + filename : filename;
-          const imgUrl = api.apiURL(`/view?filename=${encodeURIComponent(filename)}&type=input&subfolder=${encodeURIComponent(subfolder)}`);
-
-          const img = new Image();
-          img.onload = () => {
-
-            let newStart = targetFrameStart;
-            if (newStart === null) {
-              // Fallback: find the first free slot, or append past the end
-              newStart = 0;
-              this.timeline.segments.sort((a, b) => a.start - b.start);
-              for (let i = 0; i < this.timeline.segments.length; i++) {
-                let seg = this.timeline.segments[i];
-                if (newStart + newLength <= seg.start) break;
-                newStart = Math.max(newStart, seg.start + seg.length);
-              }
-            }
-
-            // Use the visual timeline as the physics bound so segments can
-            // land anywhere in the padded visual area without touching duration_frames.
-            const currentDuration = this.getVisualDurationFrames();
-
-            if (targetFrameStart !== null) {
-              // Resolve physics to push existing segments
-              let tempId = "TEMP_" + Date.now();
-              this.timeline.segments.push({ id: tempId, start: newStart, length: newLength, type: "temp" });
-              let physicsCenter = newStart + this.getFrameRate() / 2;
-              let result = this._applyCenterDragPhysics(this.timeline.segments, tempId, newStart, physicsCenter, currentDuration, currentDuration, 1);
-
-              let siblingPhysics = (this.timeline.audioSegments || []).map(s => ({ ...s }));
-
-              this._resolveGlobalPhysics(result, siblingPhysics, currentDuration, this.timeline.segments, this.timeline.audioSegments);
-
-              // Update original segments with resolved physics to preserve imgObj
-              for (let shiftedSeg of result) {
-                let original = this.timeline.segments.find(s => s.id === shiftedSeg.id);
-                if (original) {
-                  original.start = shiftedSeg.resolvedStart !== undefined ? shiftedSeg.resolvedStart : shiftedSeg.start;
-                }
-              }
-
-              for (let shiftedSib of siblingPhysics) {
-                let originalSib = this.timeline.audioSegments.find(s => s.id === shiftedSib.id);
-                if (originalSib) {
-                  originalSib.start = shiftedSib.start;
-                }
-              }
-
-              let tempSeg = this.timeline.segments.find(s => s.id === tempId);
-              newStart = tempSeg.start;
-              this.timeline.segments = this.timeline.segments.filter(s => s.id !== tempId);
-              targetFrameStart = newStart + newLength; // For the next file in batch
-            }
-
-            // Use the full intended length — the timeline has already been grown to fit.
-            let constrainedLength = newLength;
-
-            const seg = {
-              id: Date.now().toString() + Math.random().toString(36).substr(2, 5),
-              start: newStart,
-              length: constrainedLength,
-              prompt: "",
-              type: "image",
-              imageFile: imageFile,
-              imageB64: imgUrl
-            };
-
-            const displayImg = new Image();
-            displayImg.onload = () => {
-              seg.imgObj = displayImg;
-              this.render();
-              resolve(); // Resolve promise letting next image process
-            };
-            displayImg.src = imgUrl;
-
-            this.timeline.segments.push(seg);
-            this.timeline.segments.sort((a, b) => a.start - b.start);
-            this.selectionType = "image";
-            this.selectedIndex = this.timeline.segments.findIndex(s => s.id === seg.id);
-
-            if (!this.retakeMode) {
-              this.growTimelineIfNeeded(seg.start + seg.length);
-            }
-
-            this.updateUIFromSelection();
-            this.commitChanges(true);
-          };
-          img.src = imgUrl;
-        } catch (err) {
-          console.error("[PromptRelay] Image upload failed", err);
-          resolve();
+      const blobUrl = URL.createObjectURL(file);
+      let newStart = targetFrameStart;
+      if (newStart === null) {
+        newStart = 0;
+        this.timeline.segments.sort((a, b) => a.start - b.start);
+        for (let i = 0; i < this.timeline.segments.length; i++) {
+          let seg = this.timeline.segments[i];
+          if (newStart + newLength <= seg.start) break;
+          newStart = Math.max(newStart, seg.start + seg.length);
         }
+      } else if (this.timeline.segments.length === 0) {
+        newStart = 0;
+      } else {
+        const currentDuration = Math.max(this.getVisualDurationFrames(), newStart + newLength);
+        const tempId = "TEMP_" + Date.now();
+        this.timeline.segments.push({ id: tempId, start: newStart, length: newLength, type: "temp" });
+        const physicsCenter = newStart + newLength / 2;
+        const result = this._applyCenterDragPhysics(this.timeline.segments, tempId, newStart, physicsCenter, currentDuration, currentDuration, 1);
+        const siblingPhysics = (this.timeline.audioSegments || []).map(s => ({ ...s }));
+
+        this._resolveGlobalPhysics(result, siblingPhysics, currentDuration, this.timeline.segments, this.timeline.audioSegments);
+
+        for (let shiftedSeg of result) {
+          let original = this.timeline.segments.find(s => s.id === shiftedSeg.id);
+          if (original) original.start = shiftedSeg.resolvedStart !== undefined ? shiftedSeg.resolvedStart : shiftedSeg.start;
+        }
+        for (let shiftedSib of siblingPhysics) {
+          let originalSib = this.timeline.audioSegments.find(s => s.id === shiftedSib.id);
+          if (originalSib) originalSib.start = shiftedSib.resolvedStart !== undefined ? shiftedSib.resolvedStart : shiftedSib.start;
+        }
+
+        const tempSeg = this.timeline.segments.find(s => s.id === tempId);
+        newStart = tempSeg ? tempSeg.start : newStart;
+        this.timeline.segments = this.timeline.segments.filter(s => s.id !== tempId);
+        targetFrameStart = newStart + newLength;
+      }
+
+      const seg = {
+        id: Date.now().toString() + Math.random().toString(36).substr(2, 5),
+        start: newStart,
+        length: newLength,
+        prompt: "",
+        type: "image",
+        imageFile: "",
+        imageB64: blobUrl,
+        _blobUrl: blobUrl,
+        _uploading: true,
+      };
+
+      const displayImg = new Image();
+      displayImg.onload = () => { seg.imgObj = displayImg; this.render(); };
+      displayImg.src = blobUrl;
+
+      this.timeline.segments.push(seg);
+      this.timeline.segments.sort((a, b) => a.start - b.start);
+      this.selectionType = "image";
+      this.selectedIndex = this.timeline.segments.findIndex(s => s.id === seg.id);
+      if (!this.retakeMode) this.growTimelineIfNeeded(seg.start + seg.length);
+      this.updateUIFromSelection();
+      this.commitChanges(true);
+      this.render();
+
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (!seg.imageFile) {
+          seg.imageB64 = reader.result;
+          this.commitChanges(true);
+        }
+      };
+      reader.readAsDataURL(file);
+
+      const body = new FormData();
+      body.append("image", file);
+      body.append("subfolder", "whatdreamscost");
+      api.fetchApi("/upload/image", { method: "POST", body }).then(async resp => {
+        if (resp.status !== 200) throw new Error(`upload failed: ${resp.status}`);
+        const data = await resp.json();
+        const filename = data.name;
+        const subfolder = data.subfolder || "";
+        seg.imageFile = subfolder ? subfolder + "/" + filename : filename;
+        seg.imageB64 = api.apiURL(`/view?filename=${encodeURIComponent(filename)}&type=input&subfolder=${encodeURIComponent(subfolder)}`);
+        seg._uploading = false;
+        this.commitChanges(true);
+        this.render();
+      }).catch(err => {
+        seg._uploading = false;
+        console.error("[PromptRelay] Image upload failed", err);
+        this.render();
       });
     }
     this.fileInput.value = "";
+    return;
   }
 
   // Shared chunked upload helper for all video types in the LTX Director.
@@ -4178,12 +4295,12 @@ class TimelineEditor {
       const blobUrl = URL.createObjectURL(file);
       const vid = document.createElement('video');
       vid.crossOrigin = "Anonymous";
-      vid.preload = 'auto';
+      vid.preload = 'metadata';
       vid.muted = true;
 
       await new Promise((resolve) => {
-        vid.onloadeddata = async () => {
-          vid.onloadeddata = null;
+        vid.onloadedmetadata = async () => {
+          vid.onloadedmetadata = null;
           const clipDurationSecs = vid.duration || 1;
           const clipFrames = Math.max(1, Math.ceil(clipDurationSecs * frameRate));
 
@@ -4197,7 +4314,7 @@ class TimelineEditor {
             _uploading: true
           };
 
-          // Initialize retake region to the middle 50% of the clip (25%–75%)
+          // Initialize retake region to the middle 50% of the clip (25%...5%)
           const retakeLen = Math.max(1, Math.round(clipFrames * 0.5));
           const retakeStartFrame = Math.round((clipFrames - retakeLen) / 2);
           this.timeline.retakeStart = retakeStartFrame;
@@ -4239,17 +4356,17 @@ class TimelineEditor {
 
       await new Promise(async (resolve) => {
         try {
-          // Use a local blob URL so the video element loads instantly from disk —
+          // Use a local blob URL so the video element loads instantly from disk ...
           // no waiting for the server upload before the segment appears.
           const blobUrl = URL.createObjectURL(file);
 
           const vid = document.createElement('video');
           vid.crossOrigin = "Anonymous";
-          vid.preload = 'auto';
+          vid.preload = 'metadata';
           vid.muted = true;
 
-          vid.onloadeddata = async () => {
-            vid.onloadeddata = null; // prevent re-firing if src changes or browser buffers more data
+          vid.onloadedmetadata = async () => {
+            vid.onloadedmetadata = null; // prevent re-firing if src changes or browser buffers more data
             const clipDurationSecs = vid.duration || 1;
             const clipFrames = Math.max(1, Math.ceil(clipDurationSecs * frameRate));
             let newLength = clipFrames;
@@ -4332,7 +4449,72 @@ class TimelineEditor {
               fileSize: file.size
             };
 
-            // Extract first-frame thumbnail from local blob — instant
+            // Extract first-frame thumbnail from local blob ...instant
+            this.timeline.segments.push(vidSeg);
+            this.timeline.audioSegments.push(audSeg);
+            this.timeline.segments.sort((a, b) => a.start - b.start);
+            this.timeline.audioSegments.sort((a, b) => a.start - b.start);
+            if (!this.retakeMode) this.growTimelineIfNeeded(vidSeg.start + vidSeg.length);
+            this.selectionType = "image";
+            this.selectedIndex = this.timeline.segments.findIndex(s => s.id === vidSeg.id);
+            this.updateUIFromSelection();
+            this.commitChanges(true);
+            this.render();
+            resolve();
+
+            const IS_LARGE_FILE = file.size > 100 * 1024 * 1024;
+            if (IS_LARGE_FILE) {
+              console.log(`[LTXDirector] Large file detected (${(file.size / 1024 / 1024).toFixed(1)} MB). Offloading audio extraction to server.`);
+            } else {
+              this._extractAudioOnClient(file, audSeg.id, blobUrl);
+            }
+            this._uploadVideoFile(file).then(filePath => {
+              for (let s of this.timeline.segments) {
+                if (s._blobUrl === blobUrl || s.id === vidSeg.id) {
+                  s.imageFile = filePath;
+                  s._uploading = false;
+                }
+              }
+              for (let s of this.timeline.audioSegments) {
+                if (s._blobUrl === blobUrl || s.id === audSeg.id) {
+                  s.audioFile = filePath;
+                  s._uploading = false;
+                }
+              }
+              if (filePath) {
+                api.fetchApi(`/ltx_director_get_audio?filename=${encodeURIComponent(filePath)}`)
+                  .then(r => r.json())
+                  .then(res => {
+                    if (res.audio_file && res.peaks) {
+                      for (let s of this.timeline.audioSegments) {
+                        if (s.audioFile === filePath || s._blobUrl === blobUrl) {
+                          s.audioFile = res.audio_file;
+                          s.waveformPeaks = res.peaks;
+                          s._decoding = false;
+                          this._preloadAudioSegment(s);
+                        }
+                      }
+                    } else if (IS_LARGE_FILE) {
+                      for (let s of this.timeline.audioSegments) {
+                        if (s.audioFile === filePath || s._blobUrl === blobUrl) s._decoding = false;
+                      }
+                    }
+                    this.commitChanges(true);
+                    this.render();
+                  });
+              } else {
+                this.commitChanges(true);
+                this.render();
+              }
+            }).catch(err => {
+              console.error("[LTXDirector] Background video upload failed", err);
+              const currentVidSeg = this.timeline.segments.find(s => s.id === vidSeg.id);
+              if (currentVidSeg) currentVidSeg._uploading = false;
+              const currentAudSeg = this.timeline.audioSegments.find(s => s.id === audSeg.id);
+              if (currentAudSeg) currentAudSeg._uploading = false;
+              this.render();
+            });
+
             vid.currentTime = 0.01;
             vid.onseeked = () => {
               vid.onseeked = null;
@@ -4348,8 +4530,8 @@ class TimelineEditor {
               imgObj.src = vidSeg.imageB64;
 
               // Add to timeline immediately
-              this.timeline.segments.push(vidSeg);
-              this.timeline.audioSegments.push(audSeg);
+              if (!this.timeline.segments.some(s => s.id === vidSeg.id)) this.timeline.segments.push(vidSeg);
+              if (!this.timeline.audioSegments.some(s => s.id === audSeg.id)) this.timeline.audioSegments.push(audSeg);
               this.timeline.segments.sort((a, b) => a.start - b.start);
               this.timeline.audioSegments.sort((a, b) => a.start - b.start);
 
@@ -4361,96 +4543,8 @@ class TimelineEditor {
               this.selectedIndex = this.timeline.segments.findIndex(s => s.id === vidSeg.id);
               this.updateUIFromSelection();
               this.commitChanges(true);
-              resolve(); // resolve immediately — don't block on upload
+              resolve(); // resolve immediately ...don't block on upload
               this._ensureThumbnails(vidSeg);
-
-              // Background audio extraction (waveform peaks) — runs while user can already work
-              const IS_LARGE_FILE = file.size > 100 * 1024 * 1024;
-              if (IS_LARGE_FILE) {
-                console.log(`[LTXDirector] Large file detected (${(file.size / 1024 / 1024).toFixed(1)} MB). Offloading audio extraction to server.`);
-              } else {
-                this._extractAudioOnClient(file, audSeg.id, blobUrl);
-              }
-
-              // Background upload — runs while the user can already work.
-              // We intentionally do NOT change vid.src after upload — the blob URL
-              // works perfectly for local playback. Only imageFile/audioFile
-              // need updating so Python can find the file at generation time.
-              this._uploadVideoFile(file).then(filePath => {
-                for (let s of this.timeline.segments) {
-                  if (s._blobUrl === blobUrl || s.id === vidSeg.id) {
-                    s.imageFile = filePath;
-                    s._uploading = false;
-                  }
-                }
-                for (let s of this.timeline.audioSegments) {
-                  if (s._blobUrl === blobUrl || s.id === audSeg.id) {
-                    s.audioFile = filePath;
-                    s._uploading = false;
-                  }
-                }
-                if (blobUrl && filePath) {
-                  this._thumbnailCache = this._thumbnailCache || new Map();
-                  this._thumbnailPromises = this._thumbnailPromises || new Map();
-                  if (this._thumbnailCache.has(blobUrl)) {
-                    this._thumbnailCache.set(filePath, this._thumbnailCache.get(blobUrl));
-                  }
-                  if (this._thumbnailPromises.has(blobUrl)) {
-                    this._thumbnailPromises.set(filePath, this._thumbnailPromises.get(blobUrl));
-                  }
-                }
-
-                // Query server for extracted WAV audio file and waveform peaks
-                if (filePath) {
-                  api.fetchApi(`/ltx_director_get_audio?filename=${encodeURIComponent(filePath)}`)
-                    .then(r => r.json())
-                    .then(res => {
-                      if (res.audio_file && res.peaks) {
-                        for (let s of this.timeline.audioSegments) {
-                          if (s.audioFile === filePath || s._blobUrl === blobUrl) {
-                            s.audioFile = res.audio_file;
-                            s.waveformPeaks = res.peaks;
-                            s._decoding = false;
-                            this._preloadAudioSegment(s);
-                          }
-                        }
-                      } else {
-                        // Fallback
-                        if (IS_LARGE_FILE) {
-                          console.warn("[LTXDirector] Server audio extraction failed for large file, skipping.");
-                          for (let s of this.timeline.audioSegments) {
-                            if (s.audioFile === filePath || s._blobUrl === blobUrl) {
-                              s._decoding = false;
-                            }
-                          }
-                        } else {
-                          this._extractAudioOnClient(file, audSeg.id, blobUrl);
-                        }
-                      }
-                      this.commitChanges(true);
-                      this.render();
-                    })
-                    .catch(err => {
-                      console.error("[LTXDirector] Server audio extraction query failed:", err);
-                      for (let s of this.timeline.audioSegments) {
-                        if (s.audioFile === filePath || s._blobUrl === blobUrl) {
-                          s._decoding = false;
-                        }
-                      }
-                      this.render();
-                    });
-                } else {
-                  this.commitChanges(true);
-                  this.render();
-                }
-              }).catch(err => {
-                console.error("[LTXDirector] Background video upload failed", err);
-                const currentVidSeg = this.timeline.segments.find(s => s.id === vidSeg.id);
-                if (currentVidSeg) currentVidSeg._uploading = false;
-                const currentAudSeg = this.timeline.audioSegments.find(s => s.id === audSeg.id);
-                if (currentAudSeg) currentAudSeg._uploading = false;
-                this.render();
-              });
             };
           };
 
@@ -4516,25 +4610,105 @@ class TimelineEditor {
   }
 
   // --- Async Motion Video Upload Logic ---
-  async handleMotionUpload(files, targetFrameStart = null) {
+  async handleMotionUpload(files, targetFrameStart = null, forcedLength = null) {
     const frameRate = this.getFrameRate();
 
     for (let file of files) {
-      if (!(file.type.startsWith("video/") || file.name.toLowerCase().match(/\.(mp4|webm|mkv|avi|mov|m4v|flv|wmv)$/))) continue;
+      const nameLower = file.name.toLowerCase();
+      const isVideo = file.type.startsWith("video/") || nameLower.match(/\.(mp4|webm|mkv|avi|mov|m4v|flv|wmv)$/);
+      const isImage = file.type.startsWith("image/") || nameLower.match(/\.(jpg|jpeg|png|webp|gif|bmp)$/);
+      if (!isVideo && !isImage) continue;
 
       await new Promise(async (resolve) => {
         try {
-          // Load from local blob immediately — no waiting for server upload
+          // Load from local blob immediately ...no waiting for server upload
           const blobUrl = URL.createObjectURL(file);
+
+          if (isImage) {
+            const img = new Image();
+            img.crossOrigin = "Anonymous";
+            img.onload = () => {
+              let newLength = Math.max(1, Math.round(forcedLength || frameRate));
+              let newStart = targetFrameStart;
+
+              if (newStart === null) {
+                newStart = 0;
+                this.timeline.motionSegments.sort((a, b) => a.start - b.start);
+                for (let i = 0; i < this.timeline.motionSegments.length; i++) {
+                  let s = this.timeline.motionSegments[i];
+                  if (newStart + newLength <= s.start) break;
+                  newStart = Math.max(newStart, s.start + s.length);
+                }
+              }
+
+              const canvas = document.createElement('canvas');
+              canvas.width = Math.min(img.width, 512);
+              canvas.height = Math.round((img.height / img.width) * canvas.width);
+              const ctx = canvas.getContext('2d');
+              ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+              const seg = {
+                id: Date.now().toString() + Math.random().toString(36).substr(2, 5),
+                type: "motion_video",
+                isStaticImage: true,
+                start: newStart,
+                length: newLength,
+                trimStart: 0,
+                videoDurationFrames: newLength,
+                videoFile: "",
+                fileName: file.name,
+                videoStrength: 1.0,
+                videoAttentionStrength: 0.65,
+                resampleMode: "nearest",
+                imgObj: img,
+                imageB64: canvas.toDataURL('image/jpeg', 0.85),
+                _uploading: true,
+                _blobUrl: blobUrl,
+                fileSize: file.size
+              };
+
+              this.timeline.motionSegments.push(seg);
+              this.timeline.motionSegments.sort((a, b) => a.start - b.start);
+              if (!this.retakeMode) this.growTimelineIfNeeded(seg.start + seg.length);
+              this.selectionType = "motion";
+              this.selectedIndex = this.timeline.motionSegments.findIndex(s => s.id === seg.id);
+              this.updateUIFromSelection();
+              this.commitChanges(true);
+              this.render();
+              resolve();
+
+              this._uploadVideoFile(file).then(filePath => {
+                const currentSeg = this.timeline.motionSegments.find(s => s.id === seg.id);
+                if (currentSeg) {
+                  currentSeg.videoFile = filePath;
+                  currentSeg._uploading = false;
+                }
+                this.commitChanges(true);
+                this.render();
+              }).catch(err => {
+                console.error("[LTXDirector] Background motion image upload failed", err);
+                const currentSeg = this.timeline.motionSegments.find(s => s.id === seg.id);
+                if (currentSeg) currentSeg._uploading = false;
+                this.render();
+              });
+            };
+            img.onerror = (e) => {
+              console.error("Motion image load error", e);
+              URL.revokeObjectURL(blobUrl);
+              resolve();
+            };
+            img.src = blobUrl;
+            return;
+          }
 
           const vid = document.createElement('video');
           vid.crossOrigin = "Anonymous";
-          vid.preload = 'auto';
+          vid.preload = 'metadata';
           vid.muted = true;
           vid.onerror = (e) => { console.error("Motion video load error", e); URL.revokeObjectURL(blobUrl); resolve(); };
 
-          vid.onloadeddata = () => {
-            vid.onloadeddata = null; // prevent re-firing if src changes or browser buffers more data
+          vid.onloadedmetadata = () => {
+            vid.onloadedmetadata = null; // prevent re-firing if src changes or browser buffers more data
             const clipDurationSecs = vid.duration || 1;
             const clipFrames = Math.max(1, Math.ceil(clipDurationSecs * frameRate));
             let newLength = clipFrames;
@@ -4585,6 +4759,42 @@ class TimelineEditor {
               fileSize: file.size
             };
 
+            this.timeline.motionSegments.push(seg);
+            this.timeline.motionSegments.sort((a, b) => a.start - b.start);
+            if (!this.retakeMode) this.growTimelineIfNeeded(seg.start + seg.length);
+            this.selectionType = "motion";
+            this.selectedIndex = this.timeline.motionSegments.findIndex(s => s.id === seg.id);
+            this.updateUIFromSelection();
+            this.commitChanges(true);
+            this.render();
+            resolve();
+
+            this._uploadVideoFile(file).then(filePath => {
+              for (let s of this.timeline.motionSegments) {
+                if (s._blobUrl === blobUrl || s.id === seg.id) {
+                  s.videoFile = filePath;
+                  s._uploading = false;
+                }
+              }
+              if (blobUrl && filePath) {
+                this._thumbnailCache = this._thumbnailCache || new Map();
+                this._thumbnailPromises = this._thumbnailPromises || new Map();
+                if (this._thumbnailCache.has(blobUrl)) this._thumbnailCache.set(filePath, this._thumbnailCache.get(blobUrl));
+                if (this._thumbnailPromises.has(blobUrl)) this._thumbnailPromises.set(filePath, this._thumbnailPromises.get(blobUrl));
+              }
+              if (this.getOverrideAudioEnabled()) {
+                const s = this.timeline.motionSegments.find(s => s.id === seg.id);
+                if (s) this._preloadMotionAudioSegment(s);
+              }
+              this.commitChanges(true);
+              this.render();
+            }).catch(err => {
+              console.error("[LTXDirector] Background motion video upload failed", err);
+              const currentSeg = this.timeline.motionSegments.find(s => s.id === seg.id);
+              if (currentSeg) currentSeg._uploading = false;
+              this.render();
+            });
+
             vid.currentTime = 0.01;
             vid.onseeked = () => {
               vid.onseeked = null;
@@ -4600,7 +4810,7 @@ class TimelineEditor {
               imgObj.src = seg.imageB64;
 
               // Add to timeline immediately
-              this.timeline.motionSegments.push(seg);
+              if (!this.timeline.motionSegments.some(s => s.id === seg.id)) this.timeline.motionSegments.push(seg);
               this.timeline.motionSegments.sort((a, b) => a.start - b.start);
 
               if (!this.retakeMode) {
@@ -4611,45 +4821,8 @@ class TimelineEditor {
               this.selectedIndex = this.timeline.motionSegments.findIndex(s => s.id === seg.id);
               this.updateUIFromSelection();
               this.commitChanges(true);
-              resolve(); // resolve immediately — don't block on upload
+              resolve(); // resolve immediately ...don't block on upload
               this._ensureThumbnails(seg);
-
-              // Background upload — runs while the user can already work.
-              // We intentionally do NOT change vid.src after upload — the blob URL
-              // works perfectly for local playback. Only videoFile needs updating
-              // so Python can find the file at generation time.
-              this._uploadVideoFile(file).then(filePath => {
-                for (let s of this.timeline.motionSegments) {
-                  if (s._blobUrl === blobUrl || s.id === seg.id) {
-                    s.videoFile = filePath;
-                    s._uploading = false;
-                  }
-                }
-                if (blobUrl && filePath) {
-                  this._thumbnailCache = this._thumbnailCache || new Map();
-                  this._thumbnailPromises = this._thumbnailPromises || new Map();
-                  if (this._thumbnailCache.has(blobUrl)) {
-                    this._thumbnailCache.set(filePath, this._thumbnailCache.get(blobUrl));
-                  }
-                  if (this._thumbnailPromises.has(blobUrl)) {
-                    this._thumbnailPromises.set(filePath, this._thumbnailPromises.get(blobUrl));
-                  }
-                }
-                const isOverrideAudio = this.getOverrideAudioEnabled();
-                if (isOverrideAudio) {
-                  const s = this.timeline.motionSegments.find(s => s.id === seg.id);
-                  if (s) {
-                    this._preloadMotionAudioSegment(s);
-                  }
-                }
-                this.commitChanges(true);
-                this.render();
-              }).catch(err => {
-                console.error("[LTXDirector] Background motion video upload failed", err);
-                const currentSeg = this.timeline.motionSegments.find(s => s.id === seg.id);
-                if (currentSeg) currentSeg._uploading = false;
-                this.render();
-              });
             };
           };
 
@@ -4668,6 +4841,106 @@ class TimelineEditor {
   async handleAudioUpload(files, targetFrameStart = null) {
     const frameRate = this.getFrameRate();
     const durationFrames = this.getDurationFrames();
+
+    for (let file of files) {
+      if (!file.type.startsWith("audio/")) continue;
+
+      await new Promise((resolve) => {
+        const blobUrl = URL.createObjectURL(file);
+        const audioEl = document.createElement("audio");
+        audioEl.preload = "metadata";
+        audioEl.onloadedmetadata = () => {
+          const clipFrames = Math.max(1, Math.ceil((audioEl.duration || 1) * frameRate));
+          let newStart = targetFrameStart;
+          if (newStart === null) {
+            newStart = 0;
+            this.timeline.audioSegments.sort((a, b) => a.start - b.start);
+            for (let i = 0; i < this.timeline.audioSegments.length; i++) {
+              let seg = this.timeline.audioSegments[i];
+              if (newStart + clipFrames <= seg.start) break;
+              newStart = Math.max(newStart, seg.start + seg.length);
+            }
+          }
+
+          const seg = {
+            id: Date.now().toString() + Math.random().toString(36).substr(2, 5),
+            type: "audio",
+            start: newStart,
+            length: clipFrames,
+            trimStart: 0,
+            audioDurationFrames: clipFrames,
+            audioFile: "",
+            fileName: file.name,
+            waveformPeaks: [],
+            _blobUrl: blobUrl,
+            _uploading: true,
+            _decoding: true,
+          };
+
+          this.timeline.audioSegments.push(seg);
+          this.timeline.audioSegments.sort((a, b) => a.start - b.start);
+          if (!this.retakeMode) this.growTimelineIfNeeded(seg.start + seg.length);
+          this.selectionType = "audio";
+          this.selectedIndex = this.timeline.audioSegments.findIndex(s => s.id === seg.id);
+          this.updateUIFromSelection();
+          this.commitChanges(true);
+          this.render();
+          resolve();
+
+          const body = new FormData();
+          body.append("image", file);
+          body.append("subfolder", "whatdreamscost");
+          api.fetchApi("/upload/image", { method: "POST", body }).then(async resp => {
+            if (resp.status !== 200) throw new Error(`upload failed: ${resp.status}`);
+            const data = await resp.json();
+            const filename = data.name;
+            const subfolder = data.subfolder || "";
+            seg.audioFile = subfolder ? subfolder + "/" + filename : filename;
+            seg._uploading = false;
+            this.commitChanges(true);
+            this.render();
+          }).catch(err => {
+            seg._uploading = false;
+            console.error("[PromptRelay] Audio upload failed", err);
+            this.render();
+          });
+
+          file.arrayBuffer().then(arrayBuffer => {
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            return audioCtx.decodeAudioData(arrayBuffer);
+          }).then(audioBuffer => {
+            const channelData = audioBuffer.getChannelData(0);
+            const peaks = [];
+            const numPeaks = 200;
+            const step = Math.max(1, Math.floor(channelData.length / numPeaks));
+            for (let i = 0; i < numPeaks; i++) {
+              let max = 0;
+              for (let j = 0; j < step; j++) {
+                const val = Math.abs(channelData[i * step + j] || 0);
+                if (val > max) max = val;
+              }
+              peaks.push(max);
+            }
+            seg.waveformPeaks = peaks;
+            seg._audioBuffer = audioBuffer;
+            seg._decoding = false;
+            this.commitChanges(true);
+            this.render();
+          }).catch(err => {
+            seg._decoding = false;
+            console.error("[PromptRelay] Audio decode failed", err);
+            this.render();
+          });
+        };
+        audioEl.onerror = () => {
+          URL.revokeObjectURL(blobUrl);
+          resolve();
+        };
+        audioEl.src = blobUrl;
+      });
+    }
+    this.audioFileInput.value = "";
+    return;
 
     for (let file of files) {
       if (!file.type.startsWith("audio/")) continue;
@@ -4750,7 +5023,7 @@ class TimelineEditor {
             targetFrameStart = newStart + newLength;
           }
 
-          // Use the full clip length — timeline has already grown to fit.
+          // Use the full clip length ...timeline has already grown to fit.
           let constrainedLength = newLength;
 
           const seg = {
@@ -5907,6 +6180,19 @@ class TimelineEditor {
     }
   }
 
+  updateDragReadout(seg) {
+    if (!seg || this.isMultiSelectActive()) return;
+    if (this.durationValue) {
+      this.durationValue.value = (seg.length / this.getFrameRate()).toFixed(2);
+    }
+    if (this.segmentBoundsDisplay) {
+      const startStr = this.formatTime(seg.start, true);
+      const endStr = this.formatTime(seg.start + seg.length, true);
+      const lengthStr = this.formatTime(seg.length, true);
+      this.segmentBoundsDisplay.textContent = `Start: ${startStr} | End: ${endStr} | Length: ${lengthStr}`;
+    }
+  }
+
 
   updateRetakeUIState() {
     const isRetake = this.retakeMode;
@@ -6026,7 +6312,7 @@ class TimelineEditor {
       if (activeSeg) this._ensureVideoEl(activeSeg);
 
       if (this.timeline.motionSegments) {
-        const activeMotionSeg = this.timeline.motionSegments.find(s => s.type === "motion_video" && targetFrame >= s.start && targetFrame < s.start + s.length);
+        const activeMotionSeg = this.timeline.motionSegments.find(s => s.type === "motion_video" && !s.isStaticImage && targetFrame >= s.start && targetFrame < s.start + s.length);
         if (activeMotionSeg) this._ensureVideoEl(activeMotionSeg);
       }
     }
@@ -6385,10 +6671,10 @@ class TimelineEditor {
           let displayText = labelText;
           const maxTextW = Math.max(0, boxW - labelPadX * 2 - 8);
           if (this.ctx.measureText(displayText).width > maxTextW) {
-            while (displayText.length > 0 && this.ctx.measureText(displayText + "…").width > maxTextW) {
+            while (displayText.length > 0 && this.ctx.measureText(displayText + "...").width > maxTextW) {
               displayText = displayText.slice(0, -1);
             }
-            displayText = displayText.length > 0 ? displayText + "…" : "";
+            displayText = displayText.length > 0 ? displayText + "..." : "";
           }
 
           if (displayText.length > 0) {
@@ -6435,10 +6721,10 @@ class TimelineEditor {
           this.ctx.textBaseline = "middle";
           const maxFileTextW = videoWidthPx - 42 - 10;
           if (this.ctx.measureText(fname).width > maxFileTextW) {
-            while (fname.length > 0 && this.ctx.measureText(fname + "…").width > maxFileTextW) {
+            while (fname.length > 0 && this.ctx.measureText(fname + "...").width > maxFileTextW) {
               fname = fname.slice(0, -1);
             }
-            fname += "…";
+            fname += "...";
           }
           const textW = this.ctx.measureText(fname).width;
           this.ctx.fillStyle = "rgba(0, 0, 0, 0.50)";
@@ -6540,7 +6826,7 @@ class TimelineEditor {
             this.ctx.clip();
 
             if (imgRatio > boxRatio) {
-              // Fits width, vertical letterboxing (black bars top/bottom) — keep as is
+              // Fits width, vertical letterboxing (black bars top/bottom) ...keep as is
               this.ctx.drawImage(drawSource, drawX, drawY, drawW, drawH);
             } else {
               // Fits height, horizontal letterboxing (black bars left/right)
@@ -6609,10 +6895,10 @@ class TimelineEditor {
               this.ctx.textBaseline = "middle";
               const maxFileTextW = pxWidth - 42 - 10;
               if (this.ctx.measureText(fname).width > maxFileTextW) {
-                while (fname.length > 0 && this.ctx.measureText(fname + "…").width > maxFileTextW) {
+                while (fname.length > 0 && this.ctx.measureText(fname + "...").width > maxFileTextW) {
                   fname = fname.slice(0, -1);
                 }
-                fname += "…";
+                fname += "...";
               }
               const textW = this.ctx.measureText(fname).width;
               this.ctx.fillStyle = "rgba(0, 0, 0, 0.50)";
@@ -6648,10 +6934,10 @@ class TimelineEditor {
               this.ctx.textBaseline = "middle";
               const maxFileTextW = pxWidth - 42 - 10;
               if (this.ctx.measureText(fname).width > maxFileTextW) {
-                while (fname.length > 0 && this.ctx.measureText(fname + "…").width > maxFileTextW) {
+                while (fname.length > 0 && this.ctx.measureText(fname + "...").width > maxFileTextW) {
                   fname = fname.slice(0, -1);
                 }
-                fname += "…";
+                fname += "...";
               }
               const textW = this.ctx.measureText(fname).width;
               this.ctx.fillStyle = "rgba(0, 0, 0, 0.50)";
@@ -6711,10 +6997,10 @@ class TimelineEditor {
             const maxTextW = pxWidth - 10;
             let label = seg.prompt;
             if (this.ctx.measureText(label).width > maxTextW) {
-              while (label.length > 0 && this.ctx.measureText(label + "…").width > maxTextW) {
+              while (label.length > 0 && this.ctx.measureText(label + "...").width > maxTextW) {
                 label = label.slice(0, -1);
               }
-              label += "…";
+              label += "...";
             }
 
             this.ctx.fillText(label, startX + pxWidth / 2, overlayY + overlayH / 2);
@@ -6751,7 +7037,7 @@ class TimelineEditor {
             const maxLines = Math.max(1, Math.floor((this.blockHeight - pad * 2) / lineH));
             if (lines.length > maxLines) {
               lines = lines.slice(0, maxLines);
-              lines[lines.length - 1] += "…";
+              lines[lines.length - 1] += "...";
             }
 
             const totalTextHeight = lines.length * lineH;
@@ -6928,17 +7214,17 @@ class TimelineEditor {
               this.ctx.beginPath();
               this.ctx.rect(startX, trackY, pxWidth, this.motionTrackHeight);
               this.ctx.clip();
-              let rawPath = seg.videoFile || "";
+              let rawPath = seg.videoFile || seg.fileName || "";
               let fname = rawPath.split(/[/\\]/).pop() || "";
               this.ctx.font = "9px sans-serif";
               this.ctx.textAlign = "left";
               this.ctx.textBaseline = "middle";
               const maxFileTextW = pxWidth - 75 - 10;
               if (this.ctx.measureText(fname).width > maxFileTextW) {
-                while (fname.length > 0 && this.ctx.measureText(fname + "…").width > maxFileTextW) {
+                while (fname.length > 0 && this.ctx.measureText(fname + "...").width > maxFileTextW) {
                   fname = fname.slice(0, -1);
                 }
-                fname += "…";
+                fname += "...";
               }
               const textW = this.ctx.measureText(fname).width;
               this.ctx.fillStyle = "rgba(0, 0, 0, 0.50)";
@@ -6975,10 +7261,10 @@ class TimelineEditor {
             const maxTextW = pxWidth - 10;
             let label = globalPromptStr;
             if (this.ctx.measureText(label).width > maxTextW) {
-              while (label.length > 0 && this.ctx.measureText(label + "…").width > maxTextW) {
+              while (label.length > 0 && this.ctx.measureText(label + "...").width > maxTextW) {
                 label = label.slice(0, -1);
               }
-              label += "…";
+              label += "...";
             }
 
             this.ctx.fillText(label, startX + pxWidth / 2, overlayY + overlayH / 2);
@@ -7169,7 +7455,7 @@ class TimelineEditor {
     }
 
     // --- Out-of-duration shadow overlay ---
-    // Skip in retake mode — the retake region has its own overlay and the
+    // Skip in retake mode ...the retake region has its own overlay and the
     // start/end frame widgets are locked, so this overlay would be misleading.
     if (!this.retakeMode) {
       const startFrames = this.getStartFrames();
@@ -7464,7 +7750,7 @@ class TimelineEditor {
     if (e.button !== 0) return;
     const { x, y } = this.getMousePos(e);
 
-    // In retake mode: block box selection — no multi-segment operations allowed
+    // In retake mode: block box selection ...no multi-segment operations allowed
     if (e.shiftKey && !this.retakeMode) {
       this._isSelectingBox = true;
       this._isDragging = true;
@@ -7609,7 +7895,7 @@ class TimelineEditor {
           return;
         }
       }
-      // Retake mode consumed the interaction — do NOT fall through to normal timeline
+      // Retake mode consumed the interaction ...do NOT fall through to normal timeline
       return;
     }
 
@@ -7762,6 +8048,9 @@ class TimelineEditor {
   }
 
   onMouseMove(e) {
+    if (!this.container?.isConnected) return;
+    if (!this._isDragging && !this._isSelectingBox && !this._isHovering) return;
+    if (!this._isDragging && !this._isSelectingBox && this.container.offsetParent === null) return;
     const { x: mouseX, y: mouseY } = this.getMousePos(e);
 
     if (this._isSelectingBox && this._dragType === "box_select") {
@@ -7862,7 +8151,7 @@ class TimelineEditor {
 
       const frameRate = this.getFrameRate();
 
-      // Handle playhead drag in retakeMode — the RAF loop is paused, so seek directly
+      // Handle playhead drag in retakeMode ...the RAF loop is paused, so seek directly
       if (this._dragType === "playhead") {
         this.canvas.style.cursor = "ew-resize";
         let mouseFrameX = mouseX * (totalFrames / logicalWidth);
@@ -8247,7 +8536,7 @@ class TimelineEditor {
       for (const track of ["image", "motion"]) {
         const prevSegs = this._multiDragPreviewTimelines[track];
         for (const s of prevSegs) {
-          if (selectedIds.includes(s.id) && (s.type === "video" || s.type === "motion_video")) {
+          if (selectedIds.includes(s.id) && (s.type === "video" || (s.type === "motion_video" && !s.isStaticImage))) {
             this._liveScrubVideo(s, "start");
           }
         }
@@ -8407,7 +8696,7 @@ class TimelineEditor {
           }
         }
 
-        if (this.selectionType === "audio" || t[targetIdx].type === "video" || t[targetIdx].type === "motion_video") {
+        if (this.selectionType === "audio" || t[targetIdx].type === "video" || (t[targetIdx].type === "motion_video" && !t[targetIdx].isStaticImage)) {
           const origDur = t[targetIdx].audioDurationFrames || t[targetIdx].videoDurationFrames || t[targetIdx].length;
           maxPossibleLength = Math.min(maxPossibleLength, origDur - (t[targetIdx].trimStart || 0));
         }
@@ -8476,7 +8765,7 @@ class TimelineEditor {
           }
         }
 
-        if (this.selectionType === "audio" || t[targetIdx].type === "video" || t[targetIdx].type === "motion_video") {
+        if (this.selectionType === "audio" || t[targetIdx].type === "video" || (t[targetIdx].type === "motion_video" && !t[targetIdx].isStaticImage)) {
           minPossibleStart = Math.max(minPossibleStart, t[targetIdx].start - (t[targetIdx].trimStart || 0));
         }
 
@@ -8486,7 +8775,7 @@ class TimelineEditor {
         let diff = newStart - t[targetIdx].start;
         t[targetIdx].start = newStart;
         t[targetIdx].length -= diff;
-        if (this.selectionType === "audio" || t[targetIdx].type === "video" || t[targetIdx].type === "motion_video") {
+        if (this.selectionType === "audio" || t[targetIdx].type === "video" || (t[targetIdx].type === "motion_video" && !t[targetIdx].isStaticImage)) {
           t[targetIdx].trimStart += diff;
         }
 
@@ -8633,7 +8922,7 @@ class TimelineEditor {
       }
     }
 
-    this.updateUIFromSelection(); // Live update of trim values
+    this.updateDragReadout(t.find(s => s.id === this._dragTargetId));
     this.render();
   }
 
@@ -8829,8 +9118,9 @@ class TimelineEditor {
 
   _restoreTransientProperties(copiedSegs, originalSegs) {
     if (!copiedSegs || !originalSegs) return;
+    const originalsById = new Map(originalSegs.map(seg => [seg.id, seg]));
     for (let ps of copiedSegs) {
-      const orig = originalSegs.find(s => s.id === ps.id);
+      const orig = originalsById.get(ps.id);
       if (orig) {
         if (orig._uploading !== undefined) ps._uploading = orig._uploading;
         if (orig._decoding !== undefined) ps._decoding = orig._decoding;
@@ -9058,6 +9348,7 @@ class TimelineEditor {
       this._multiDragInitialSegments = null;
       this._multiDragPreviewTimelines = null;
       this.canvas.style.cursor = "default";
+      this.updateUIFromSelection();
       this.commitChanges();
     }
   }
@@ -10233,6 +10524,23 @@ class TimelineEditor {
       menu.appendChild(vidBtn);
       menu.appendChild(pasteImageBtn);
     } else if (currentTrack === "motion") {
+      const imgBtn = document.createElement("button");
+      imgBtn.className = "pr-gap-menu-btn";
+      imgBtn.innerHTML = `${ICONS.upload} Image Segment`;
+      imgBtn.onclick = () => {
+        this.dismissContextMenu();
+        const fi = document.createElement("input");
+        fi.type = "file"; fi.accept = "image/*";
+        fi.addEventListener("change", (ev) => {
+          if (ev.target.files?.[0]) {
+            const gapLength = gap.frameEnd - gap.frameStart;
+            this.handleMotionUpload([ev.target.files[0]], gap.frameStart, gapLength);
+          }
+        });
+        fi.click();
+      };
+      menu.appendChild(imgBtn);
+
       const vidBtn = document.createElement("button");
       vidBtn.className = "pr-gap-menu-btn";
       vidBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg> Video Segment`;
@@ -10348,6 +10656,23 @@ class TimelineEditor {
       menu.appendChild(vidBtn);
       menu.appendChild(pasteImageBtn);
     } else if (currentTrack === "motion") {
+      const imgBtn = document.createElement("button");
+      imgBtn.className = "pr-gap-menu-btn";
+      imgBtn.innerHTML = `${ICONS.upload} Image Segment`;
+      imgBtn.addEventListener("click", () => {
+        this.dismissGapMenu();
+        const fi = document.createElement("input");
+        fi.type = "file"; fi.accept = "image/*";
+        fi.addEventListener("change", (ev) => {
+          if (ev.target.files?.[0]) {
+            const gapLength = gap.frameEnd - gap.frameStart;
+            this.handleMotionUpload([ev.target.files[0]], gap.frameStart, gapLength);
+          }
+        });
+        fi.click();
+      });
+      menu.appendChild(imgBtn);
+
       const vidBtn = document.createElement("button");
       vidBtn.className = "pr-gap-menu-btn";
       vidBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg> Video Segment`;
@@ -10668,8 +10993,8 @@ class TimelineEditor {
 
       // Trigger ComfyUI's change-detection pipeline the same way a real user
       // interaction does: by dispatching a pointerup on the canvas. This fires
-      // LiteGraph's onAfterChange → ChangeTracker.captureCanvasState() →
-      // workflowDraftStore.saveDraft() → localStorage. This is what the user
+      // LiteGraph's onAfterChange 閳?ChangeTracker.captureCanvasState() 閳?
+      // workflowDraftStore.saveDraft() 閳?localStorage. This is what the user
       // experiences when they "move something" and it persists correctly.
       setTimeout(() => {
         try {
@@ -11307,7 +11632,7 @@ class TimelineEditor {
     if (isOverrideAudio && !this.retakeMode) {
       if (this.timeline.motionSegments) {
         for (let seg of this.timeline.motionSegments) {
-          if (seg.videoFile || seg._blobUrl) {
+          if (!seg.isStaticImage && (seg.videoFile || seg._blobUrl)) {
             segmentsToPlay.push({
               type: 'motion',
               originalSeg: seg,
@@ -11503,11 +11828,11 @@ class TimelineEditor {
             if (seg === activeSeg) {
               const expectedSec = (seg.trimStart + (this.currentFrame - seg.start)) / frameRate;
               if (seg.videoEl.paused && !seg.videoEl.seeking) {
-                // Not playing and no seek in flight — start a fresh seek+play
+                // Not playing and no seek in flight ...start a fresh seek+play
                 seg.videoEl.currentTime = expectedSec;
                 seg.videoEl.play().catch(e => console.warn("Video play prevented", e));
               } else if (!seg.videoEl.paused && Math.abs(seg.videoEl.currentTime - expectedSec) > 0.5) {
-                // Already playing but drifted — resync
+                // Already playing but drifted ...resync
                 seg.videoEl.currentTime = expectedSec;
               }
               // If paused && seeking: a seek+play is already in flight, let it finish
@@ -11524,19 +11849,19 @@ class TimelineEditor {
       // Sync motion playback
       if (!this.retakeMode) {
         const activeMotionSegments = (this._isDragging && this._previewSegments && this.selectionType === "motion") ? this._previewSegments : this.timeline.motionSegments;
-        const activeMotionSeg = activeMotionSegments.find(s => s.type === "motion_video" && this.currentFrame >= s.start && this.currentFrame < s.start + s.length);
+        const activeMotionSeg = activeMotionSegments.find(s => s.type === "motion_video" && !s.isStaticImage && this.currentFrame >= s.start && this.currentFrame < s.start + s.length);
         const activeMotionVideoEl = activeMotionSeg ? activeMotionSeg.videoEl : null;
 
         for (const seg of activeMotionSegments) {
-          if (seg.type === "motion_video" && seg.videoEl) {
+          if (seg.type === "motion_video" && !seg.isStaticImage && seg.videoEl) {
             if (seg === activeMotionSeg) {
               const expectedSec = (seg.trimStart + (this.currentFrame - seg.start)) / frameRate;
               if (seg.videoEl.paused && !seg.videoEl.seeking) {
-                // Not playing and no seek in flight — start a fresh seek+play
+                // Not playing and no seek in flight ...start a fresh seek+play
                 seg.videoEl.currentTime = expectedSec;
                 seg.videoEl.play().catch(e => console.warn("Video play prevented", e));
               } else if (!seg.videoEl.paused && Math.abs(seg.videoEl.currentTime - expectedSec) > 0.5) {
-                // Already playing but drifted — resync
+                // Already playing but drifted ...resync
                 seg.videoEl.currentTime = expectedSec;
               }
               // If paused && seeking: a seek+play is already in flight, let it finish
@@ -11589,7 +11914,7 @@ class TimelineEditor {
 
       // Sync motion segments on pause
       for (const seg of this.timeline.motionSegments) {
-        if (seg.type === "motion_video" && seg.videoEl) {
+        if (seg.type === "motion_video" && !seg.isStaticImage && seg.videoEl) {
           if (!seg.videoEl.paused) {
             seg.videoEl.pause();
           }
@@ -11621,6 +11946,32 @@ const APPENDED_WIDGET_DEFAULTS = [
   ["segment_lengths", ""],
   ["transition_smoothness", ""],
 ];
+const DIRECTOR_WIDGET_DEFAULTS = {
+  inpaint_audio: true,
+  override_audio: false,
+  use_ic_video_size: false,
+  use_custom_audio: false,
+  use_custom_motion: true,
+  frame_rate: 24,
+  display_mode: "seconds",
+  custom_width: 0,
+  custom_height: 0,
+  resize_method: "maintain aspect ratio",
+  divisible_by: 32,
+  img_compression: 18,
+  guide_strength: "",
+  transition_smoothness: "",
+  local_prompts: "",
+  segment_lengths: "",
+  timeline_data: "{}",
+  epsilon: 0.001,
+  start_second: 0.0,
+  end_second: 5.0,
+  duration_seconds: 5.0,
+  start_frame: 0,
+  end_frame: 120,
+  duration_frames: 120,
+};
 
 function markYusuNode(node) {
   if (!node.properties) node.properties = {};
@@ -11761,12 +12112,20 @@ app.registerExtension({
           }
         };
 
+        this._syncICVideoFromLink = function () {
+          const input = self.inputs?.find(i => i.name === "ic_lora_video");
+          const link = input?.link != null ? app.graph.links[input.link] : null;
+          const originNode = link ? app.graph.getNodeById(link.origin_id) : null;
+          self._timelineEditor?.syncLinkedICFrames(link?.id ?? input?.link ?? null, originNode);
+        };
+
         const origOnConnectionsChange = this.onConnectionsChange;
         this.onConnectionsChange = function (type, index, connected, link_info) {
           if (origOnConnectionsChange) {
             origOnConnectionsChange.apply(this, arguments);
           }
           self._syncGlobalPromptFromLink();
+          self._syncICVideoFromLink();
         };
 
         const origOnDrawForeground = this.onDrawForeground;
@@ -11826,6 +12185,9 @@ app.registerExtension({
           this.properties = { ...this.properties, ...info.properties };
         }
         markYusuNode(this);
+        if (!this.inputs?.some(input => input.name === "ic_lora_video")) {
+          this.addInput?.("ic_lora_video", "IMAGE", { shape: 7 });
+        }
 
         // Helper to set widget value, sync DOM element, and trigger callbacks safely
         const setWidgetValue = (w, val) => {
@@ -11847,96 +12209,42 @@ app.registerExtension({
           }
         };
 
-        // 2. Check if we have serialized properties. If so, restore widgets from properties!
-        if (info.properties && info.properties.has_serialized_properties) {
+        // Prefer named properties whenever an older workflow already contains them.
+        const namedWidgetPropertyCount = info.properties
+          ? (this.widgets || []).filter(
+            w => w.name && Object.prototype.hasOwnProperty.call(info.properties, w.name)
+          ).length
+          : 0;
+        const hasNamedWidgetProperties = namedWidgetPropertyCount >= 8;
+        if (info.properties && (info.properties.has_serialized_properties || hasNamedWidgetProperties)) {
           if (this.widgets) {
             for (const w of this.widgets) {
               if (w.name && this.properties[w.name] !== undefined) {
-                setWidgetValue(w, this.properties[w.name]);
+                setWidgetValue(
+                  w,
+                  normalizeDirectorWidgetValue(w.name, this.properties[w.name], DIRECTOR_WIDGET_DEFAULTS[w.name]),
+                );
               }
             }
           }
         } else if (info.widgets_values) {
-          // Fallback to name-based schema mapping for older workflows
-          const SCHEMA_19 = [
-            "start_frame", "end_frame", "duration_frames",
-            "timeline_data", "use_custom_audio", "use_custom_motion", "inpaint_audio", "local_prompts", "segment_lengths",
-            "epsilon", "frame_rate", "display_mode", "guide_strength", "custom_width", "custom_height",
-            "resize_method", "divisible_by", "img_compression", "timeline_ui"
-          ];
-          const SCHEMA_21_NO_INPAINT = [
-            "start_second", "end_second", "duration_seconds", "start_frame", "end_frame", "duration_frames",
-            "timeline_data", "local_prompts", "segment_lengths", "epsilon", "guide_strength",
-            "use_custom_audio", "use_custom_motion", "frame_rate", "display_mode", "custom_width", "custom_height",
-            "resize_method", "divisible_by", "img_compression", "timeline_ui"
-          ];
-          const SCHEMA_22_NO_INPAINT = [
-            "start_second", "end_second", "duration_seconds", "start_frame", "end_frame", "duration_frames",
-            "timeline_data", "local_prompts", "segment_lengths", "epsilon", "guide_strength",
-            "use_custom_audio", "use_custom_motion", "frame_rate", "display_mode", "custom_width", "custom_height",
-            "resize_method", "divisible_by", "img_compression", "override_audio", "timeline_ui"
-          ];
-          const SCHEMA_22_WITH_INPAINT = [
-            "start_second", "end_second", "duration_seconds", "start_frame", "end_frame", "duration_frames",
-            "timeline_data", "use_custom_audio", "use_custom_motion", "inpaint_audio", "local_prompts", "segment_lengths",
-            "epsilon", "frame_rate", "display_mode", "guide_strength", "custom_width", "custom_height",
-            "resize_method", "divisible_by", "img_compression", "timeline_ui"
-          ];
-          const SCHEMA_23 = [
-            "start_second", "end_second", "duration_seconds", "start_frame", "end_frame", "duration_frames",
-            "timeline_data", "use_custom_audio", "use_custom_motion", "inpaint_audio", "local_prompts", "segment_lengths",
-            "epsilon", "frame_rate", "display_mode", "guide_strength", "custom_width", "custom_height",
-            "resize_method", "divisible_by", "img_compression", "override_audio", "timeline_ui"
-          ];
-
-          const ALL_WIDGET_DEFAULTS = {
-            inpaint_audio: true,
-            override_audio: false,
-            use_ic_video_size: false,
-            use_custom_audio: false,
-            use_custom_motion: true,
-            frame_rate: 24,
-            display_mode: "seconds",
-            custom_width: 0,
-            custom_height: 0,
-            resize_method: "maintain aspect ratio",
-            divisible_by: 32,
-            img_compression: 18,
-            guide_strength: "",
-            transition_smoothness: "",
-            local_prompts: "",
-            segment_lengths: "",
-            timeline_data: "{}",
-            epsilon: 0.001,
-            start_second: 0.0,
-            end_second: 5.0,
-            duration_seconds: 5.0,
-            start_frame: 0,
-            end_frame: 120,
-            duration_frames: 120,
-          };
-
-          let names = SCHEMA_23;
+          const names = selectDirectorWidgetSchema(info.widgets_values);
           const len = info.widgets_values.length;
-          if (len <= 19) {
-            names = SCHEMA_19;
-          } else if (len === 21) {
-            names = SCHEMA_21_NO_INPAINT;
-          } else if (len === 22) {
-            if (typeof info.widgets_values[13] === "number") {
-              names = SCHEMA_22_NO_INPAINT;
-            } else {
-              names = SCHEMA_22_WITH_INPAINT;
-            }
-          }
 
           if (this.widgets) {
             for (const w of this.widgets) {
               const schemaIdx = names.indexOf(w.name);
               if (schemaIdx !== -1 && schemaIdx < len) {
-                setWidgetValue(w, info.widgets_values[schemaIdx]);
-              } else if (ALL_WIDGET_DEFAULTS.hasOwnProperty(w.name)) {
-                setWidgetValue(w, ALL_WIDGET_DEFAULTS[w.name]);
+                setWidgetValue(
+                  w,
+                  normalizeDirectorWidgetValue(
+                    w.name,
+                    info.widgets_values[schemaIdx],
+                    DIRECTOR_WIDGET_DEFAULTS[w.name],
+                  ),
+                );
+              } else if (Object.prototype.hasOwnProperty.call(DIRECTOR_WIDGET_DEFAULTS, w.name)) {
+                setWidgetValue(w, DIRECTOR_WIDGET_DEFAULTS[w.name]);
               }
             }
           }
@@ -11950,6 +12258,16 @@ app.registerExtension({
             }
           }
           this.properties.has_serialized_properties = true;
+        }
+
+        for (const w of this.widgets || []) {
+          if (Object.prototype.hasOwnProperty.call(DIRECTOR_WIDGET_DEFAULTS, w.name)) {
+            setWidgetValue(
+              w,
+              normalizeDirectorWidgetValue(w.name, w.value, DIRECTOR_WIDGET_DEFAULTS[w.name]),
+            );
+            this.properties[w.name] = w.value;
+          }
         }
 
         for (const [name, def] of APPENDED_WIDGET_DEFAULTS) {

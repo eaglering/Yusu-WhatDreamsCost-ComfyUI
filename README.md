@@ -43,6 +43,58 @@ Released: 2026-07-02
 - Removed obsolete full-audio restore/add-at-playhead context-menu actions.
 - Removed noisy debug logging from the Director timeline editor.
 
+## Version 2.0.2
+
+Released: 2026-07-15
+
+### Added
+
+- Added IC-LoRA image segment support on the IC track, including toolbar upload, drag-and-drop, and gap-menu insertion.
+- Added a small regression test for IC-LoRA image file detection.
+
+### Improved
+
+- Optimized image, audio, video, and IC video imports so timeline segments appear immediately while upload/decoding continues in the background.
+- Optimized Prompt Relay for single-prompt timelines by bypassing attention masking and reusing patched model clones per node.
+- Improved IC video loading by using metadata-first loading, reducing the wait before clips appear on the timeline.
+
+### Fixed
+
+- Fixed newly inserted main-track images covering later images/text/video segments by restoring insertion physics in the fast upload path.
+- Fixed the first main-track image drop not snapping to frame 0 when the track is empty.
+- Fixed IC-LoRA image segments being treated as videos by the guide node.
+- Fixed static IC-LoRA images being sent through video scrubbing, thumbnail extraction, and motion-audio preview paths.
+- Fixed optional latent time alignment by cropping or padding connected latents to the Director target frame count.
+- Updated `YusuSpeechLengthCalculator` so dialogue length detection only reads text inside double quotes and Chinese double quotes.
+
+## Version 2.0.3
+
+Released: 2026-07-16
+
+### Added
+
+- Added an optional `IC-LoRA Video` IMAGE input to `Yusu LTX Director`, allowing frame batches from standard video loader nodes to be used directly as IC-LoRA motion guidance.
+- Added a linked IC timeline segment for connected frame batches. Manually imported IC clips take priority, and the connected input is restored automatically after manual clips are removed.
+
+### Improved
+
+- Improved timeline dragging performance for image, text, audio, video, and IC segments by coalescing mouse movement to one update per animation frame.
+- Reduced drag-time DOM work by updating only segment start, end, and duration readouts until the drag is committed.
+- Reduced workflow-switch overhead by cleaning up inactive listeners, media elements, thumbnail caches, audio buffers, and resize polling.
+
+### Fixed
+
+- Fixed connected IC frame batches not reaching the Director Guide motion encoding path.
+- Fixed failed manual IC uploads incorrectly suppressing a connected IC input.
+- Fixed `IC Size` selection priority so a valid manual IC clip takes precedence over connected frame dimensions.
+- Fixed Prompt Relay compatibility with newer `ComfyUI-KJNodes` LTX2 NAG mask callbacks, supporting both the original 3-argument call and the newer 5-argument call.
+- Fixed legacy workflow widget migration across historical 19/21/22/23-field layouts, preventing raw Director widgets, shifted values, and invalid `NaN` parameters.
+- Restored the `IC-LoRA Video` input automatically when loading workflows saved before that input existed.
+
+### Compatibility
+
+- Declared ComfyUI `v0.3.48` as the minimum supported version because the plugin uses `comfy_api.latest`.
+
 ## Node Namespace
 
 This fork registers the following Yusu node IDs:
